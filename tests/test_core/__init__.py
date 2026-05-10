@@ -1,0 +1,1 @@
+# test_core package — 核心模块接口契约测试

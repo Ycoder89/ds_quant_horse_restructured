@@ -1,0 +1,78 @@
+# =============================================================================
+# ORB Enhanced 策略参数 — TSLA 加强版
+# 基于 cc_quant_horse orb_tsla.yaml 改进（PLAN 策略 A）
+# =============================================================================
+
+strategy:
+  class: "strategies.orb_enhanced.ORBEnhanced"
+  name: "orb_tsla_5min"
+  symbols: ["TSLA"]
+  timeframe: "5min"
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# ORB 核心参数
+# ---------------------------------------------------------------------------
+orb_window_minutes: 45        # 45分钟开盘区间 (9:30-10:15)
+breakout_buffer_pct: 0.18     # 突破 buffer: 18% ORB 区间
+
+# 方向控制
+long_only_mode: false         # false=双向, true=仅多头（单边牛市时启用）
+
+# ---------------------------------------------------------------------------
+# 交易时间窗口 (ET)
+# ---------------------------------------------------------------------------
+no_entry_after: "11:00"       # 11:00 后不再接受新突破
+force_close_time: "15:45"     # 15:45 强制平仓
+
+# ---------------------------------------------------------------------------
+# 入场过滤链 (由 RiskManager 的 EntryFilter 链处理)
+# ---------------------------------------------------------------------------
+entry_filters:
+  - type: "VWAPFilter"
+    params:
+      price_side: "same"      # 仅在价格与 VWAP 同侧时通过
+  - type: "VolumeFilter"
+    params:
+      lookback: 20
+      multiplier: 1.2
+      enabled: true
+  - type: "ADXFilter"
+    params:
+      period: 14
+      threshold: 20
+      enabled: true
+  - type: "SpreadFilter"
+    params:
+      max_spread_pct: 0.5     # 滑点太大时过滤
+  - type: "RegimeFilter"
+    params:
+      skip_regimes: ["PANIC", "HIGH_VOL"]
+      skip_short_regimes: ["TRENDING_UP"]
+
+# ---------------------------------------------------------------------------
+# 止损/退出管理 (由 ExitManager 链处理)
+# ---------------------------------------------------------------------------
+exit_managers:
+  - type: "FixedStop"
+    params:
+      stop_fraction: 0.8      # 0.8× ORB 区间宽度
+      stop_style: "midline_or_fraction"
+  - type: "TrailingStop"
+    params:
+      activation_r: 1.0       # 盈利达 1× 初始风险时激活
+      trail_pct: 0.3          # 回撤 30% 离场
+  - type: "TimeStop"
+    params:
+      force_close_time: "15:45"
+
+# ---------------------------------------------------------------------------
+# 风控参数
+# ---------------------------------------------------------------------------
+risk:
+  max_risk_pct_per_trade: 0.3   # 单笔最大风险 0.3%
+  max_daily_loss_pct: 1.0       # 日最大亏损 1%
+  max_daily_trades: 1           # 每日最多 1 笔
+  position_sizing: "FRACTION_ATR"
+  atr_period: 14
+  risk_multiplier: 2.0          # 止损距离 = ATR × 2.0

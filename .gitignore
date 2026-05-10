@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.env
+.venv
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test & coverage
+.pytest_cache/
+htmlcov/
+.coverage
+*.coverage
+
+# Results & outputs
+results/*.csv
+results/*.json
+results/*.png
+results/*.html
+!results/.gitkeep
+
+# Logs
+*.log
+logs/
+!logs/.gitkeep
+
+# Config (sensitive)
+config/local.yaml
+config/secrets.yaml
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Data (read from original project)
+data/cache/
+data/futures.db
+data/stocks.db
+
+# Research result databases (auto-generated, not source)
+research/hunter_results/*.db
