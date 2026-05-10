@@ -10,6 +10,7 @@ from core.filters import (
     ADXFilter, FilterChain, FilterContext, RegimeFilter, SpreadFilter,
     VWAPSideFilter, VolumeSpikeFilter, default_filter_registry,
 )
+from core.regime import RegimeState, RegimeType
 
 TS = datetime(2025, 9, 15, 9, 35)
 
@@ -171,35 +172,57 @@ class TestSpreadFilter:
         assert ok is False
 
 
+def _make_regime_ctx(regime_str: str) -> FilterContext:
+    """辅助：用字符串创建带 RegimeState 的 FilterContext（向后兼容测试用）"""
+    # 尝试匹配 RegimeType，否则用 UNKNOWN
+    try:
+        rt = RegimeType(regime_str)
+    except ValueError:
+        rt = RegimeType.UNKNOWN
+    return FilterContext(
+        regime_state=RegimeState(
+            regime_type=rt,
+            size_multiplier=1.0,
+            preferred_strategies=[],
+            blocked_strategies=[],
+        )
+    )
+
+
 class TestRegimeFilter:
     def test_no_condition_passes(self):
+        # HIGH_VOL 矩阵允许 "orb_enhanced"，无 EntryConditions 限制 → 应通过
         f = RegimeFilter()
-        ctx = FilterContext(regime="HIGH_VOL")
-        signal = SignalEvent("TSLA", OrderSide.BUY, 100.0, 99.0, "TEST", TS)
+        ctx = _make_regime_ctx("HIGH_VOL")
+        signal = SignalEvent("TSLA", OrderSide.BUY, 100.0, 99.0, "orb_enhanced", TS)
         ok, _ = f.filter(signal, ctx)
         assert ok is True
 
     def test_allowed_regime_passes(self):
+        # TRENDING_BULL 在 allowed_regimes 且策略在矩阵允许列表 → 应通过
         f = RegimeFilter()
-        ctx = FilterContext(regime="TRENDING")
-        signal = SignalEvent("TSLA", OrderSide.BUY, 100.0, 99.0, "TEST", TS,
-                             entry_conditions=EntryConditions(allowed_regimes={"TRENDING", "MEAN_REVERTING"}))
+        ctx = _make_regime_ctx("TRENDING_BULL")
+        signal = SignalEvent("TSLA", OrderSide.BUY, 100.0, 99.0, "orb_enhanced", TS,
+                             entry_conditions=EntryConditions(
+                                 allowed_regimes={"TRENDING_BULL", "RANGING"}))
         ok, _ = f.filter(signal, ctx)
         assert ok is True
 
     def test_not_in_allowed_blocks(self):
         f = RegimeFilter()
-        ctx = FilterContext(regime="HIGH_VOL")
+        ctx = _make_regime_ctx("HIGH_VOL")
         signal = SignalEvent("TSLA", OrderSide.BUY, 100.0, 99.0, "TEST", TS,
-                             entry_conditions=EntryConditions(allowed_regimes={"TRENDING"}))
+                             entry_conditions=EntryConditions(
+                                 allowed_regimes={"TRENDING_BULL"}))
         ok, _ = f.filter(signal, ctx)
         assert ok is False
 
     def test_blocked_regime_blocks(self):
         f = RegimeFilter()
-        ctx = FilterContext(regime="HIGH_VOL")
+        ctx = _make_regime_ctx("HIGH_VOL")
         signal = SignalEvent("TSLA", OrderSide.BUY, 100.0, 99.0, "TEST", TS,
-                             entry_conditions=EntryConditions(blocked_regimes={"HIGH_VOL"}))
+                             entry_conditions=EntryConditions(
+                                 blocked_regimes={"HIGH_VOL"}))
         ok, _ = f.filter(signal, ctx)
         assert ok is False
 

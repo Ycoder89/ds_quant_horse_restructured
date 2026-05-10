@@ -464,6 +464,293 @@ data/
 
 ---
 
+## Phase 3b：Regime Engine — 开盘前 + 开盘后 Regime 确认（预计 5-8 天）
+
+> **触发背景（2026-05-10）**：ES ORB 首轮 OOS 验证通过后，发现最大隐患是  
+> "均值回归策略在趋势日爆仓"（REFLECTION.md 第 6 条）。需要在每日交易前  
+> 先做 Regime 判断，再决定当天用哪种策略、是否调整仓位、是否跳过交易。
+
+### 3b.0 核心设计思路
+
+**两阶段确认**：
+
+```
+阶段 1: Pre-Market (9:00 - 9:25 AM)
+  输入：前 N 个交易日日线数据（ADX / ATR 百分位 / EMA 斜率 / 隔夜缺口）
+  输出：preliminary_regime + confidence_score
+  作用：确定今日"基础市场状态"，设置初始策略偏向
+
+阶段 2: Post-Open Confirmation (9:55 - 10:05 AM，开盘后第 5-6 根 5min bar)
+  输入：开盘后前 30 分钟的 K 线（ORB 宽度 / 方向性 / 成交量 / VWAP 位置）
+  输出：confirmed_regime（修正或确认 Phase 1 结果）+ preferred_strategies
+  作用：用实际开盘行为确认或推翻盘前判断，决定当日策略开关
+```
+
+**设计原则**：
+- Regime 分类是**每日一次决策**，不是每 bar 实时切换
+- 盘前判断 confidence < 0.6 时必须等盘后确认
+- Regime 信息注入 FilterContext，策略通过 FilterChain 自动生效
+- 回测中模拟两阶段调用（不引入 look-ahead bias）
+
+---
+
+### 3b.1 Regime 类型定义
+
+```python
+class RegimeType(Enum):
+    TRENDING_BULL  = "TRENDING_BULL"   # 强上升趋势（ADX>25, 价格>EMA20, 连续高点）
+    TRENDING_BEAR  = "TRENDING_BEAR"   # 强下降趋势（ADX>25, 价格<EMA20, 连续低点）
+    RANGING        = "RANGING"         # 震荡区间（ADX<20, 价格围绕 EMA 振荡）
+    HIGH_VOL       = "HIGH_VOL"        # 高波动（ATR > 2×近30日均ATR，或缺口>1%）
+    LOW_VOL        = "LOW_VOL"         # 低波动（ATR < 0.5×均ATR，日内振幅极小）
+    BREAKOUT       = "BREAKOUT"        # 突破转换（区间收敛 + 成交量放大）
+    CHOPPY         = "CHOPPY"          # 混乱/无方向（高ATR但无趋势，多次反转）
+    UNKNOWN        = "UNKNOWN"         # 数据不足或盘前状态
+```
+
+**策略选择矩阵**：
+
+| Regime | 推荐策略 | 禁用策略 | 仓位系数 | 交易规则 |
+|--------|---------|---------|---------|---------|
+| TRENDING_BULL | ORB（多偏置）, SwingTrend | VWAP Reversion | 1.0× | 只做多 ORB 突破 |
+| TRENDING_BEAR | ORB（空偏置）, SwingTrend | VWAP Reversion | 1.0× | 只做空 ORB 突破 |
+| RANGING | VWAP Reversion, PullbackEMA | ORB（趋势跟踪） | 0.8× | 目标缩小至 1R |
+| HIGH_VOL | ORB（须方向确认） | 均值回归类 | 0.5× | 仓位减半，止损翻倍 |
+| LOW_VOL | VWAP Reversion | SwingTrend | 0.7× | 小目标，少交易 |
+| BREAKOUT | ORB（全力参与） | VWAP Reversion | 1.0× | 等待方向确认后入场 |
+| CHOPPY | 无（跳过当日） | 全部 | 0× | 当日不交易 |
+
+---
+
+### 3b.2 文件结构
+
+```
+core/
+└── regime.py              # RegimeType 枚举 + RegimeState + RegimeClassifier ABC
+
+monitoring/
+├── __init__.py
+├── regime_engine.py       # 具体实现（ES/NQ 专用）
+└── regime_logger.py       # Regime 变化日志（审计用）
+
+config/
+└── regime.yaml            # 所有阈值参数（ADX/ATR 阈值等，不硬编码）
+
+tests/
+└── test_monitoring/
+    ├── __init__.py
+    └── test_regime.py     # Regime 分类单元测试
+```
+
+---
+
+### 3b.3 核心接口设计
+
+#### `core/regime.py`
+
+```python
+@dataclass
+class RegimeState:
+    """当日 Regime 状态快照（由 RegimeClassifier 产出，每日更新两次）"""
+    regime_type: RegimeType = RegimeType.UNKNOWN
+    confidence: float = 0.0               # 分类置信度 [0, 1]
+    size_multiplier: float = 1.0          # 仓位调节系数（CHOPPY=0, HIGH_VOL=0.5 等）
+    preferred_strategies: list[str] = field(default_factory=list)  # 推荐策略名称
+    blocked_strategies: list[str] = field(default_factory=list)    # 禁用策略名称
+    confirmed_at: Optional[datetime] = None   # 盘后确认时间（None=仅盘前）
+    indicators: dict = field(default_factory=dict)  # 诊断用：ADX/ATR百分位/缺口等
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.confirmed_at is not None
+
+    @property
+    def can_trade(self) -> bool:
+        return self.regime_type is not RegimeType.CHOPPY and self.size_multiplier > 0
+
+    def allows_strategy(self, strategy_name: str) -> bool:
+        if strategy_name in self.blocked_strategies:
+            return False
+        if self.preferred_strategies and strategy_name not in self.preferred_strategies:
+            return False
+        return True
+
+
+class RegimeClassifier(ABC):
+    """Regime 分类器抽象基类"""
+
+    @abstractmethod
+    def classify_premarket(self, daily_bars: list[Bar]) -> RegimeState:
+        """盘前分类（用前 N 日日线数据）"""
+        ...
+
+    @abstractmethod
+    def confirm_postopen(
+        self,
+        preliminary: RegimeState,
+        open_bars: list[Bar],    # 开盘后前 30 分钟的 5min bar
+    ) -> RegimeState:
+        """盘后确认（用开盘 30 分钟行情）"""
+        ...
+```
+
+#### `monitoring/regime_engine.py`
+
+```python
+class ESRegimeClassifier(RegimeClassifier):
+    """ES/NQ 期货 Regime 分类器"""
+
+    # 盘前分类：ADX + ATR 百分位 + EMA 斜率 + 隔夜缺口
+    def classify_premarket(self, daily_bars: list[Bar]) -> RegimeState:
+        adx = calc_adx(daily_bars, period=14)[-1]
+        atr = calc_atr(daily_bars, period=14)[-1]
+        atr_pct_rank = percentile_rank(atr, 30)   # ATR 在近30日中的百分位
+        ema20_slope = (ema(close, 20)[-1] - ema(close, 20)[-5]) / 5
+        gap_pct = (daily_bars[-1].open - daily_bars[-2].close) / daily_bars[-2].close
+
+        # 分类逻辑（阈值从 config/regime.yaml 读取）
+        if atr_pct_rank > 0.80 or abs(gap_pct) > 0.01:
+            return RegimeState(RegimeType.HIGH_VOL, confidence=0.75, size_multiplier=0.5)
+        if adx > 25 and ema20_slope > 0:
+            return RegimeState(RegimeType.TRENDING_BULL, confidence=0.7)
+        ...
+
+    # 盘后确认：ORB 宽度 / 方向 / 成交量 / VWAP 位置
+    def confirm_postopen(self, preliminary: RegimeState, open_bars: list[Bar]) -> RegimeState:
+        orb_width = max(b.high for b in open_bars) - min(b.low for b in open_bars)
+        direction_bias = (open_bars[-1].close - open_bars[0].open) / orb_width
+        vol_ratio = sum(b.volume for b in open_bars) / self._avg_open_volume
+        ...
+```
+
+---
+
+### 3b.4 集成点
+
+#### `core/filters.py` — FilterContext 升级
+
+```python
+# 现在：regime: str = "UNKNOWN"
+# 升级为：
+from core.regime import RegimeState
+@dataclass
+class FilterContext:
+    ...
+    regime_state: RegimeState = field(default_factory=RegimeState)  # 替换原 regime: str
+
+    @property
+    def regime(self) -> str:
+        """向后兼容：保留字符串访问接口"""
+        return self.regime_state.regime_type.value
+```
+
+#### `core/strategy.py` — 新增 Regime 钩子
+
+```python
+class Strategy(ABC):
+    ...
+    def on_regime_change(self, regime_state: "RegimeState") -> None:
+        """Regime 确认后由引擎调用（可选实现）"""
+        pass
+
+    def is_regime_allowed(self, regime_state: "RegimeState") -> bool:
+        """策略是否在当前 Regime 下允许交易"""
+        return regime_state.allows_strategy(self.name)
+```
+
+#### `engine/backtest.py` — 模拟两阶段 Regime
+
+```python
+class BacktestEngine:
+    def _run_day(self, date: datetime.date, day_bars: list[Bar]) -> None:
+        # 1. 盘前 Regime 分类（用前N日日线）
+        daily_bars = self._data_handler.get_daily_bars(date, lookback=30)
+        regime = self._regime_classifier.classify_premarket(daily_bars)
+
+        # 2. 等待开盘后 30 分钟（第 6 根 5min bar 到达时确认）
+        # 回测中：取当日前 5 根 bar 模拟盘后确认
+        open_bars = [b for b in day_bars if b.timestamp.time() < time(10, 0)]
+        if len(open_bars) >= 5:
+            regime = self._regime_classifier.confirm_postopen(regime, open_bars)
+
+        # 3. 将 RegimeState 注入 FilterContext
+        self._filter_context.regime_state = regime
+
+        # 4. 若 CHOPPY → 当日跳过
+        if not regime.can_trade:
+            self._log(f"[Regime] {date} {regime.regime_type.value} — 当日跳过")
+            return
+
+        # 5. 执行正常 bar 循环（post-open confirmation 之后的 bar 才允许入场）
+        for bar in day_bars:
+            if bar.timestamp.time() < time(10, 0):
+                continue  # 等待 Regime 确认窗口过后再入场
+            self._process_bar(bar, regime)
+```
+
+---
+
+### 3b.5 配置文件
+
+```yaml
+# config/regime.yaml
+regime_classifier:
+  lookback_days: 30              # 盘前分类使用的历史日线数
+
+  adx_trending_threshold: 25.0  # ADX > 25 → 趋势
+  adx_ranging_threshold: 20.0   # ADX < 20 → 震荡
+
+  atr_high_vol_pct: 0.80        # ATR 百分位 > 80% → HIGH_VOL
+  atr_low_vol_pct: 0.25         # ATR 百分位 < 25% → LOW_VOL
+
+  gap_high_vol_threshold: 0.010 # 缺口 > 1% → HIGH_VOL
+
+  open_bars_required: 5         # 盘后确认至少需要 N 根 5min bar
+  confirm_after_time: "10:00"   # 盘后确认时间（不允许在此之前入场）
+
+  size_multipliers:             # 各 Regime 的仓位系数
+    TRENDING_BULL: 1.0
+    TRENDING_BEAR: 1.0
+    RANGING: 0.8
+    HIGH_VOL: 0.5
+    LOW_VOL: 0.7
+    BREAKOUT: 1.0
+    CHOPPY: 0.0
+    UNKNOWN: 0.5                # 谨慎：数据不足时减仓
+
+  # 盘后确认参数
+  postopen_orb_wide_atr_ratio: 1.5   # ORB 宽度 > ATR × 1.5 → 偏向 BREAKOUT
+  postopen_direction_threshold: 0.3  # 方向偏置 > 30% → 修正 Regime 方向
+  postopen_volume_spike: 1.3         # 开盘量 > 均量 × 1.3 → 提高 BREAKOUT 概率
+```
+
+---
+
+### 3b.6 测试清单
+
+| 测试文件 | 覆盖内容 |
+|---------|---------|
+| `tests/test_monitoring/test_regime.py` | RegimeType 枚举 / RegimeState 属性 |
+| `tests/test_monitoring/test_regime_classifier.py` | 盘前分类逻辑（各 Regime 路径）|
+| `tests/test_monitoring/test_regime_postopen.py` | 盘后确认（修正 / 保持 / 推翻）|
+| `tests/test_monitoring/test_regime_filter.py` | Regime 结果注入 FilterContext |
+| `tests/test_engine/test_backtest_regime.py` | 回测中 Regime 模拟（CHOPPY 跳过 / size_multiplier 生效）|
+
+---
+
+### 3b.7 产出物
+
+- `core/regime.py` — RegimeType + RegimeState + RegimeClassifier ABC（含测试）
+- `monitoring/regime_engine.py` — ESRegimeClassifier 具体实现
+- `config/regime.yaml` — 所有阈值参数外置
+- `core/filters.py` 升级 — FilterContext.regime_state 替换原 regime: str
+- `core/strategy.py` 升级 — on_regime_change 钩子
+- `engine/backtest.py` 升级 — 模拟两阶段 Regime 确认
+- 回测结果对比：Regime 过滤前 vs 后的 Sharpe / 最大回撤 / 胜率对比
+- 单元测试全部通过
+
+---
+
 ## Phase 4：Paper 运营（预计 2-4 周）
 
 ### 4.1 目标

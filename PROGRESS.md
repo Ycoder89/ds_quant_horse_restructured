@@ -1,8 +1,8 @@
 # ds_quant_horse — 项目进度追踪
 
 > 启动日期：2026-04-26
-> 当前阶段：Phase 3a 策略发现循环 — ES ORB 首次循环完成
-> 最后更新：2026-04-30
+> 当前阶段：Phase 3b 规划完成，Regime Engine 待实现
+> 最后更新：2026-05-10
 
 ---
 
@@ -14,6 +14,7 @@ Phase 1: 核心接口层       ██████████ 100% ✅ 完成（
 Phase 2: 策略实现         ██████████ 100% ✅ 完成
 Phase 3: 回测验证         ██████████ 100% ✅ 完成
 Phase 3a: 策略发现循环    ████░░░░░░  40% （ES ORB 首轮完成，Sharpe 0.53 OOS）
+Phase 3b: Regime Engine   ████████░░  80% （核心实现完成，回测对比待做）
 Phase 4: Paper 运营       ░░░░░░░░░░   0%
 Phase 5: 实盘切换         ░░░░░░░░░░   0%
 ```
@@ -119,7 +120,7 @@ Phase 5: 实盘切换         ░░░░░░░░░░   0%
 
 ## 待办
 
-### Phase 3a — 策略发现循环（下一轮）
+### Phase 3a — 策略发现循环（下一轮，暂缓等 3b 完成后重跑）
 
 - [ ] 测试 SwingTrend / Pullback EMA 策略在 ES 上的表现
 - [ ] 改善风控过滤器（ADX 过滤已假死，实际未生效）
@@ -127,7 +128,26 @@ Phase 5: 实盘切换         ░░░░░░░░░░   0%
 - [ ] 信号质量分析（入场时间分布、失败交易共性）
 - [ ] 将合格策略的配置导出到 `config/strategies/`
 
-### Phase 3b — 数据与基础设施
+### Phase 3b — Regime Engine（当前优先级 ⭐）
+
+**核心文件（按实现顺序）：**
+
+- [x] `core/regime.py` — RegimeType(×7+UNKNOWN) + RegimeState + RegimeClassifier ABC + 策略矩阵
+- [x] `config/regime.yaml` — 所有阈值参数外置（ADX/ATR/缺口/方向/量能/仓位系数）
+- [x] `tests/test_monitoring/test_regime.py` — 27 个测试全部通过 ✅
+- [x] `monitoring/__init__.py` + `monitoring/regime_engine.py` — ESRegimeClassifier
+  - classify_premarket(): ADX + ATR 百分位 + EMA 斜率 + 隔夜缺口 → 7 种分支
+  - confirm_postopen(): ORB 宽度比 / 方向偏置 / 成交量比 → 可推翻盘前结论
+- [x] `core/filters.py` 升级 — FilterContext.regime_state 替换 regime: str（向后兼容属性）
+  - RegimeFilter 双层：EntryConditions 层 + RegimeEngine 策略矩阵层
+- [x] `core/strategy.py` 升级 — on_regime_change() 钩子 + is_regime_allowed()
+- [x] `engine/backtest.py` 升级 — 两阶段 Regime 模拟，CHOPPY 跳过，10:00 前禁止入场
+- [x] `core/data_handler.py` 升级 — get_daily_bars()（从 5min 数据聚合日线用于盘前分类）
+- [x] **256 个单元测试全部通过 ✅**（新增 27 个 Regime 测试）
+- [ ] 回测对比：Regime 过滤前 vs 后（ES ORB 2024-2026 Sharpe/回撤/CHOPPY 跳过天数）
+- [ ] `monitoring/regime_logger.py` — Regime 变化审计日志
+
+**数据与基础设施：**
 
 - [ ] 补充 NQ 5min 历史数据（当前只有 1 个月，限制多标的 ORB）
 - [ ] 多标的并行扫描支持
@@ -178,3 +198,9 @@ Total: 229 tests ✅
 | 2026-04-30 | **回调再入场改进完成**：ADT 0.8→1.4, OOS Sharpe 0.532, 负衰减                              |
 | 2026-04-30 | 三周期验证通过（IS 2024 + OOS 2025 + OOS 2026 Q1）                                     |
 | 2026-04-30 | 15 条结果保存到 data/hunter.db                                                      |
+| 2026-05-10 | **Phase 3b Regime Engine 计划完成**：两阶段确认设计、RegimeType × 7、策略矩阵、集成点规划         |
+| 2026-05-10 | 初始 Git commit 推送至 GitHub (Ycoder89/ds_quant_horse_restructured)，58 文件提交       |
+| 2026-05-10 | **Phase 3b 核心实现完成**：core/regime.py + monitoring/regime_engine.py + config/regime.yaml |
+| 2026-05-10 | FilterContext 升级：regime_state 替换 regime: str，RegimeFilter 双层检查（条件层+矩阵层） |
+| 2026-05-10 | BacktestEngine 升级：两阶段 Regime 模拟（盘前+盘后确认，CHOPPY 跳过，10:00 前禁止入场） |
+| 2026-05-10 | 256 个单元测试全部通过 ✅（新增 27 个 Regime 测试，修复 TimeStopExit 测试 API）           |

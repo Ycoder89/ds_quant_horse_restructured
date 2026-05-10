@@ -338,7 +338,7 @@ class DefaultRiskManager(RiskManager):
         默认实现只提供最小上下文。
         """
         return FilterContext(
-            regime="UNKNOWN",
+            regime_state=None,  # 无 Regime 信息时默认允许（regime 属性返回 "UNKNOWN"）
             vwap_daily=0.0,
             spread_pct=0.0,
             atr_14=abs(signal.entry_price - signal.stop_loss),

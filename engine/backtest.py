@@ -33,7 +33,9 @@ from core.exit import (
     TimeStopExit,
     TrailingStopExit,
 )
+from core.filters import FilterContext
 from core.portfolio import Portfolio, SimplePortfolio, Trade
+from core.regime import RegimeClassifier, RegimeState, RegimeType
 from core.risk_manager import DefaultRiskManager, RiskManager
 from core.strategy import Strategy
 from engine.metrics import BacktestMetrics, compute_metrics
@@ -70,6 +72,9 @@ class BacktestResult:
     # 评估指标
     metrics: Optional[BacktestMetrics] = None
 
+    # Regime 统计
+    regime_skipped_days: int = 0      # 因 CHOPPY/HIGH_VOL 跳过的交易日数
+
     # 参数（用于策略搜索对比）
     params: dict = field(default_factory=dict)
 
@@ -93,6 +98,8 @@ class BacktestResult:
             f"{self.signals_blocked_risk} risk",
             f"  Trades: {len(self.trades)}  PnL: ${self.total_pnl:+.2f}",
         ]
+        if self.regime_skipped_days > 0:
+            lines.append(f"  Regime Skipped Days: {self.regime_skipped_days}")
         if self.metrics:
             lines.append("")
             for line in self.metrics.summary().split("\n"):
@@ -135,6 +142,9 @@ class BacktestEngine:
         exit_manager: Optional[ExitManager] = None,
         initial_capital: float = 100_000.0,
         contract_multiplier: float = 1.0,
+        regime_classifier: Optional[RegimeClassifier] = None,
+        regime_daily_lookback: int = 30,
+        regime_confirm_hour: int = 10,   # 10:00 AM 后才允许入场（Regime 确认后）
     ) -> None:
         self._dh = data_handler
         self._strategy = strategy
@@ -151,6 +161,10 @@ class BacktestEngine:
             TakeProfitExit(risk_reward=2.0),
             TimeStopExit(max_bars=18),  # 18 bars = 90 分钟
         ])
+        # Regime 分类器（可选）
+        self._regime_classifier = regime_classifier
+        self._regime_daily_lookback = regime_daily_lookback
+        self._regime_confirm_hour = regime_confirm_hour
 
         self._initial_capital = initial_capital
         self._result = BacktestResult(
@@ -163,6 +177,9 @@ class BacktestEngine:
         self._current_stop: Optional[float] = None
         self._pending_stop: Optional[float] = None  # 策略计算的止损（传递给 exit）
         self._last_date: Optional[date] = None
+        self._current_regime: RegimeState = RegimeState()  # 当日 Regime 状态
+        self._day_open_bars: list = []           # 当日开盘后已积累的 bar（用于盘后确认）
+        self._regime_confirmed: bool = False     # 当日是否已完成盘后确认
 
     # ---- 事件回调 ----
 
@@ -238,6 +255,8 @@ class BacktestEngine:
 
         self._current_bar: Optional[DataEvent] = None
 
+        symbol = self._strategy.symbols[0]
+
         for event in self._dh.stream():
             self._current_bar = event
             self._result.total_bars += 1
@@ -249,15 +268,79 @@ class BacktestEngine:
                     self._handle_eod()
                 self._result.trading_days.append(bar_date)
                 self._last_date = bar_date
+                self._day_open_bars = []
+                self._regime_confirmed = False
                 self._strategy.on_session_start(bar_date.isoformat())
 
-            # 取主要标的的 bar（策略的第一个 symbol）
-            symbol = self._strategy.symbols[0]
+                # ── 盘前 Regime 分类 ──────────────────────────────────────────
+                if self._regime_classifier is not None:
+                    daily_bars = self._dh.get_daily_bars(
+                        symbol=symbol,
+                        end_date=bar_date,
+                        lookback=self._regime_daily_lookback,
+                    )
+                    self._current_regime = self._regime_classifier.classify_premarket(
+                        daily_bars
+                    )
+                    self._strategy.on_regime_change(self._current_regime)
+                    logger.info(
+                        "[Regime] %s 盘前: %s (conf=%.2f)",
+                        bar_date, self._current_regime.regime_type.value,
+                        self._current_regime.confidence,
+                    )
+                    # CHOPPY 当日直接跳过
+                    if not self._current_regime.can_trade:
+                        logger.info("[Regime] %s 当日跳过（%s）",
+                                    bar_date, self._current_regime.regime_type.value)
+                        self._result.regime_skipped_days += 1
+
+            # 取主要标的的 bar
             bar = event.get_bar(symbol)
             if bar is None:
                 continue
 
-            # ── 第一步：检查持仓退出（优先于入场，避免同 bar 入场即退出的 look-ahead） ──
+            # ── 当日跳过（CHOPPY 或 size_mult=0）───────────────────────────────
+            if (self._regime_classifier is not None
+                    and not self._current_regime.can_trade):
+                # 即使跳过也要处理持仓成交（避免挂单堆积）
+                fills = self._execution.process_bar(bar)
+                for fill in fills:
+                    self._portfolio.on_fill(fill)
+                continue
+
+            # ── 盘后 Regime 确认 (~10:00 AM) ─────────────────────────────────
+            bar_hour = event.timestamp.hour
+            bar_minute = event.timestamp.minute
+            if (self._regime_classifier is not None
+                    and not self._regime_confirmed):
+                self._day_open_bars.append(bar)
+                # 到达确认时间且有足够 bar 时执行确认
+                if (bar_hour >= self._regime_confirm_hour
+                        or (bar_hour == self._regime_confirm_hour - 1 and bar_minute >= 55)):
+                    self._current_regime = self._regime_classifier.confirm_postopen(
+                        self._current_regime, self._day_open_bars
+                    )
+                    self._regime_confirmed = True
+                    self._strategy.on_regime_change(self._current_regime)
+                    logger.info(
+                        "[Regime] %s 盘后确认: %s (conf=%.2f, size=%.1f×)",
+                        bar_date, self._current_regime.regime_type.value,
+                        self._current_regime.confidence,
+                        self._current_regime.size_multiplier,
+                    )
+                    if not self._current_regime.can_trade:
+                        logger.info("[Regime] 盘后确认后跳过 (%s)",
+                                    self._current_regime.regime_type.value)
+                        self._result.regime_skipped_days += 1
+
+            # ── 盘后确认时间前：不入场（持仓正常管理）────────────────────────
+            regime_entry_blocked = (
+                self._regime_classifier is not None
+                and not self._regime_confirmed
+                and bar_hour < self._regime_confirm_hour
+            )
+
+            # ── 第一步：检查持仓退出（优先于入场）───────────────────────────
             if self._current_position is not None and not self._current_position.is_flat:
                 should_exit, exit_sig, new_stop = self._exit_mgr.check(
                     self._current_position, bar, self._current_stop,
@@ -267,13 +350,13 @@ class BacktestEngine:
                 if should_exit and exit_sig is not None:
                     self._submit_exit(exit_sig)
 
-            # ── 第二步：策略信号生成（当前 bar 关盘价入场） ──
-            signal = self._strategy.on_bar(event)
-            if signal is not None:
-                self._on_signal(signal)
+            # ── 第二步：策略信号生成（Regime 确认后才允许入场） ──────────────
+            if not regime_entry_blocked:
+                signal = self._strategy.on_bar(event)
+                if signal is not None:
+                    self._on_signal(signal)
 
-            # ── 第三步：处理挂单成交 ──
-            # fill_on_next_bar=True 时，新提交的订单延迟到下次 process_bar 成交
+            # ── 第三步：处理挂单成交 ─────────────────────────────────────────
             fills = self._execution.process_bar(bar)
             for fill in fills:
                 self._portfolio.on_fill(fill)

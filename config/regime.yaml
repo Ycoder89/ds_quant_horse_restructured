@@ -1,0 +1,66 @@
+# config/regime.yaml — Regime 分类器阈值参数
+# 所有数值在此处配置，monitoring/regime_engine.py 从此读取，不硬编码
+
+regime_classifier:
+
+  # ─── 盘前分类参数 ────────────────────────────────────────────────────────────
+
+  # 历史窗口
+  lookback_days: 30              # 盘前分类使用的历史日线天数
+
+  # ADX 趋势强度阈值
+  adx_trending_threshold: 25.0  # ADX > 25 → 有显著趋势
+  adx_ranging_threshold: 20.0   # ADX < 20 → 震荡区间
+
+  # ATR 波动百分位（相对近 lookback_days 日）
+  atr_high_vol_percentile: 0.80  # ATR 百分位 > 80% → HIGH_VOL
+  atr_low_vol_percentile: 0.25   # ATR 百分位 < 25% → LOW_VOL
+
+  # EMA 斜率（趋势方向确认）
+  ema_period: 20                 # EMA 周期
+  ema_slope_lookback: 5          # 斜率 = (EMA[0] - EMA[-N]) / N
+  ema_slope_up_threshold: 0.05   # 斜率 > 0.05 点/日 → 上升偏置
+  ema_slope_down_threshold: -0.05 # 斜率 < -0.05 → 下降偏置
+
+  # 隔夜缺口（开盘价 vs 前日收盘价）
+  gap_high_vol_threshold: 0.010  # 缺口 > 1% → 推向 HIGH_VOL
+  gap_small_threshold: 0.003     # 缺口 < 0.3% → 震荡特征
+
+  # CHOPPY 识别（高 ATR 但无方向）
+  choppy_adx_threshold: 22.0    # ADX 介于 ranging 和 trending 之间
+  choppy_direction_limit: 0.20  # 日线涨跌幅 < 20% of ATR → 混乱
+
+  # ─── 盘后确认参数 (Post-Open Confirmation) ──────────────────────────────────
+
+  # 需要多少根开盘 5min bar 才能做盘后确认
+  open_bars_required: 5          # 至少 5 根（=开盘 25 分钟后）
+
+  # 入场禁止时间（盘后确认完成前禁止入场）
+  confirm_after_time: "10:00"    # 10:00 AM 前不开仓（等待确认）
+
+  # ORB 宽度相对 ATR 的倍数
+  orb_wide_atr_ratio: 1.5        # ORB 宽度 > ATR × 1.5 → 偏向 BREAKOUT / HIGH_VOL
+  orb_narrow_atr_ratio: 0.5      # ORB 宽度 < ATR × 0.5 → 偏向 LOW_VOL
+
+  # 方向偏置（开盘 30 分钟 close vs open，归一到 ORB 宽度）
+  direction_strong_threshold: 0.40  # > 40% ORB 宽度 → 强方向偏置（确认趋势）
+  direction_weak_threshold: 0.15    # < 15% → 无方向（偏向 RANGING / CHOPPY）
+
+  # 开盘成交量比（开盘 30 分钟实际量 vs 近期均值）
+  vol_spike_threshold: 1.50      # > 1.5× 均量 → 放量突破（BREAKOUT 特征）
+  vol_low_threshold: 0.70        # < 0.7× 均量 → 缩量（LOW_VOL 特征）
+
+  # 置信度权重（盘后确认时，盘前结论的保留权重）
+  premarket_weight: 0.40         # 盘前结论占 40%
+  postopen_weight: 0.60          # 盘后行情占 60%
+
+  # ─── 仓位系数矩阵 ────────────────────────────────────────────────────────────
+  size_multipliers:
+    TRENDING_BULL: 1.0
+    TRENDING_BEAR: 1.0
+    RANGING:       0.8
+    HIGH_VOL:      0.5
+    LOW_VOL:       0.7
+    BREAKOUT:      1.0
+    CHOPPY:        0.0
+    UNKNOWN:       0.5           # 数据不足时谨慎减仓

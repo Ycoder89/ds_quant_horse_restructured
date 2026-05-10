@@ -26,9 +26,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from core.events import Bar, DataEvent, EntryConditions, OrderSide, SignalEvent
+
+if TYPE_CHECKING:
+    from core.regime import RegimeState
 
 
 # =============================================================================
@@ -105,6 +108,23 @@ class Strategy(ABC):
     def on_session_start(self, date_str: str) -> None:
         """新交易日开始（由引擎调用）"""
         pass
+
+    def on_regime_change(self, regime_state: "RegimeState") -> None:
+        """
+        Regime 确认后由引擎调用（盘前 + 盘后各一次）。
+
+        策略可选实现：根据 Regime 调整内部参数（如只做多/空偏置）。
+        默认行为：将 regime_state 存储为 self._current_regime 供 on_bar() 读取。
+        """
+        self._current_regime: Optional["RegimeState"] = regime_state
+
+    def is_regime_allowed(self, regime_state: "RegimeState") -> bool:
+        """
+        当前 Regime 是否允许此策略运行。
+
+        由引擎在调用 on_bar() 前检查。返回 False 时跳过本 bar 的信号生成。
+        """
+        return regime_state.allows_strategy(self.name)
 
     def on_finish(self) -> None:
         """策略清理（回测结束时调用一次）"""

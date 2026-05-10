@@ -21,9 +21,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from core.events import Bar, EntryConditions, OrderSide, SignalEvent
+
+if TYPE_CHECKING:
+    from core.regime import RegimeState
 
 
 # =============================================================================
@@ -36,18 +39,42 @@ class FilterContext:
     运行时环境快照，传给每个 EntryFilter。
 
     字段：
-      bars:       最近 N 根 5min K 线（从最新到最旧）
-      regime:     当前市场 Regime（如 "TRENDING" / "RANGING" / "HIGH_VOL"）
-      vwap_daily: 日内实时 VWAP 均值
-      spread_pct: 当前 bid-ask 价差百分比
-      atr_14:     当前 14 周期 ATR（平均真实波幅）
+      bars:         最近 N 根 5min K 线（从最新到最旧）
+      regime_state: 当日 Regime 状态（RegimeState，含 regime_type / size_multiplier / preferred 等）
+      vwap_daily:   日内实时 VWAP 均值
+      spread_pct:   当前 bid-ask 价差百分比
+      atr_14:       当前 14 周期 ATR（平均真实波幅）
+      latest_price: 最新成交价
+
+    向后兼容：regime 属性返回 regime_state.regime_type.value 字符串。
     """
     bars: list[Bar] = field(default_factory=list)
-    regime: str = "UNKNOWN"
+    regime_state: Optional["RegimeState"] = None  # None 时 regime 属性返回 "UNKNOWN"
     vwap_daily: float = 0.0
     spread_pct: float = 0.0
     atr_14: float = 0.0
     latest_price: float = 0.0
+
+    @property
+    def regime(self) -> str:
+        """向后兼容：返回 regime_type 的字符串值"""
+        if self.regime_state is None:
+            return "UNKNOWN"
+        return self.regime_state.regime_type.value
+
+    @property
+    def size_multiplier(self) -> float:
+        """当前 Regime 的仓位调节系数"""
+        if self.regime_state is None:
+            return 1.0
+        return self.regime_state.size_multiplier
+
+    @property
+    def can_trade(self) -> bool:
+        """当前 Regime 是否允许任何交易"""
+        if self.regime_state is None:
+            return True  # 无 Regime 信息时不阻止（默认允许）
+        return self.regime_state.can_trade
 
 
 # =============================================================================
@@ -250,23 +277,34 @@ class SpreadFilter(EntryFilter):
 
 
 class RegimeFilter(EntryFilter):
-    """Regime 过滤：当前 Regime 必须在允许列表内且不在禁止列表内"""
+    """
+    Regime 过滤：同时检查两层：
+      1. EntryConditions 中的 allowed_regimes / blocked_regimes（策略声明的偏好）
+      2. RegimeState 中的 preferred_strategies / blocked_strategies（Regime 引擎的决定）
+    """
 
     name = "Regime"
 
     def filter(self, signal: SignalEvent, ctx: FilterContext) -> tuple[bool, str]:
         conditions = signal.entry_conditions
-        regime = ctx.regime
+        regime = ctx.regime  # 字符串，向后兼容
 
-        # 优先检查禁止列表
+        # ── 层 1: EntryConditions 中的 regime 偏好 ─────────────────────────────
         if regime in conditions.blocked_regimes:
-            return False, f"当前 Regime={regime} 在禁止列表 {conditions.blocked_regimes}"
+            return False, f"Regime={regime} 在策略禁止列表 {conditions.blocked_regimes}"
 
-        # 检查允许列表（空 = 不限制）
         if conditions.allowed_regimes and regime not in conditions.allowed_regimes:
-            return False, (
-                f"当前 Regime={regime} 不在允许列表 {conditions.allowed_regimes}"
-            )
+            return False, f"Regime={regime} 不在策略允许列表 {conditions.allowed_regimes}"
+
+        # ── 层 2: RegimeState 的策略矩阵（若已注入）──────────────────────────
+        if ctx.regime_state is not None:
+            rs = ctx.regime_state
+            if not rs.can_trade:
+                return False, f"Regime={regime} 当日禁止交易 (size_mult={rs.size_multiplier})"
+            if not rs.allows_strategy(signal.strategy):
+                blocked = signal.strategy in rs.blocked_strategies
+                reason = "策略被 Regime 禁用" if blocked else "策略不在 Regime 推荐列表"
+                return False, f"[RegimeEngine] {reason}: strategy={signal.strategy}, Regime={regime}"
 
         return True, f"pass (Regime={regime})"
 

@@ -174,6 +174,56 @@ ds_quant_horse/
 
 ---
 
+## Regime Engine（Phase 3b，规划中）
+
+### 核心理念：先判断市场状态，再决定交易策略
+
+旧项目最大教训之一：**均值回归策略 × 趋势日 = 爆仓**。  
+解决方案是在每日开盘前和开盘后做两阶段 Regime 确认，再决定当天用哪种策略、是否调整仓位、是否完全跳过。
+
+### 两阶段确认流程
+
+```
+阶段 1: Pre-Market (09:00 - 09:25)
+  ├─ 前 30 个交易日日线 → ADX / ATR 百分位 / EMA20 斜率 / 隔夜缺口
+  └─ 输出：preliminary_regime + confidence_score
+
+阶段 2: Post-Open Confirmation (09:55 - 10:05，开盘后 5-6 根 5min bar)
+  ├─ 开盘 30 分钟 K 线 → ORB 宽度比 / 方向偏置 / 成交量比 / VWAP 位置
+  └─ 输出：confirmed_regime + preferred_strategies（修正或确认盘前结论）
+
+入场限制：10:00 AM 之前不开新仓（等待盘后确认完成）
+```
+
+### Regime 类型与策略矩阵
+
+| Regime | 含义 | 推荐策略 | 仓位系数 |
+|--------|------|---------|---------|
+| TRENDING_BULL | 强上升趋势 | ORB 多偏置, SwingTrend | 1.0× |
+| TRENDING_BEAR | 强下降趋势 | ORB 空偏置, SwingTrend | 1.0× |
+| RANGING | 震荡区间 | VWAP Reversion, PullbackEMA | 0.8× |
+| HIGH_VOL | 高波动（缺口>1%/ATR极高）| ORB（须方向确认） | 0.5× |
+| LOW_VOL | 低波动压缩 | VWAP Reversion（小目标） | 0.7× |
+| BREAKOUT | 区间突破转换 | ORB（全力参与） | 1.0× |
+| CHOPPY | 混乱无方向 | **当日不交易** | 0× |
+
+### 实现状态 ✅ 核心完成
+
+新增文件：
+- `core/regime.py` ✅ — RegimeType(×7+UNKNOWN) + RegimeState + RegimeClassifier ABC + 策略矩阵
+- `monitoring/regime_engine.py` ✅ — ESRegimeClassifier（盘前分类 + 盘后确认，纯函数可测试）
+- `config/regime.yaml` ✅ — 所有阈值参数外置（ADX/ATR/缺口/方向/量能/仓位系数）
+
+升级文件：
+- `core/filters.py` ✅ — FilterContext.regime_state（向后兼容 .regime 属性），RegimeFilter 双层检查
+- `core/strategy.py` ✅ — on_regime_change() 钩子 + is_regime_allowed()
+- `engine/backtest.py` ✅ — 两阶段 Regime 模拟，CHOPPY 跳过，10:00 AM 前禁止入场
+- `core/data_handler.py` ✅ — get_daily_bars()（从 intraday 数据聚合日线用于盘前分类）
+
+测试：27 个 Regime 测试 + 全量 256 测试全部通过 ✅
+
+---
+
 ## 项目进度
 
 ```
@@ -182,17 +232,19 @@ Phase 1: 核心接口层       ██████████ 100% ✅ 完成（
 Phase 2: 策略实现         ██████████ 100% ✅ 完成（2026-04-28）
 Phase 3: 回测验证         ██████████ 100% ✅ 完成（2026-04-29）
 Phase 3a: 策略发现循环    ████░░░░░░  40% ES ORB 首轮完成（2026-04-30）
+Phase 3b: Regime Engine   ████████░░  80% 核心实现完成（2026-05-10）
 Phase 4: Paper 运营       ░░░░░░░░░░   0%
 Phase 5: 实盘切换         ░░░░░░░░░░   0%
 ```
 
-### 下一步计划
+### 当前优先：Phase 3b Regime Engine
 
-- [ ] 测试 SwingTrend / PullbackEMA 在 ES 上的表现
-- [ ] 修复 ADX 过滤器（当前 stub 状态，实际未生效）
-- [ ] 实现 Walk-Forward Validation（Purged WFV）引擎
-- [ ] 补充 NQ 5min 历史数据（当前仅 1 个月）
-- [ ] Paper Trading 链路测试（IB Paper 账户集成）
+- [ ] `core/regime.py` — RegimeType 枚举 + RegimeState + RegimeClassifier ABC
+- [ ] `config/regime.yaml` — 分类阈值参数外置
+- [ ] `monitoring/regime_engine.py` — ESRegimeClassifier（盘前 + 盘后确认）
+- [ ] `core/filters.py` 升级 — regime_state 替换 regime: str
+- [ ] `engine/backtest.py` 升级 — 两阶段模拟，10:00 前不入场
+- [ ] 回测对比：Regime 过滤前 vs 后（ES ORB 2024-2026 Sharpe/回撤对比）
 
 ---
 

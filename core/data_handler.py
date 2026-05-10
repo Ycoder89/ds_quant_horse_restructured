@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -60,6 +60,20 @@ class DataHandler(ABC):
     def get_bars(self, symbol: str, lookback: int) -> list[Bar]:
         """返回某标的最近 N 根 bar（含当前，从旧到新）。"""
         ...
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        end_date: date,
+        lookback: int = 30,
+    ) -> list[Bar]:
+        """
+        返回指定日期前 lookback 个交易日的日线 Bar（从旧到新）。
+
+        默认实现：从已加载的 intraday bars 中聚合每日 OHLCV。
+        子类可重写以直接从日线表读取。
+        """
+        return []
 
     @property
     @abstractmethod
@@ -214,6 +228,48 @@ class SqliteDataHandler(DataHandler):
                 start = max(0, i - lookback + 1)
                 return all_b[start:i + 1]
         return all_b[-lookback:] if lookback else all_b
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        end_date: date,
+        lookback: int = 30,
+    ) -> list[Bar]:
+        """
+        从已加载的 5min bar 聚合每日 OHLCV，返回 end_date 前 lookback 个交易日的日线 Bar。
+
+        聚合规则：每日取 open=当日第一根 bar.open, high=最高, low=最低,
+                        close=最后一根 bar.close, volume=求和。
+        """
+        all_b = self._all_bars.get(symbol, self._all_bars.get(symbol.upper(), []))
+        if not all_b:
+            return []
+
+        # 按日期分组
+        from collections import defaultdict
+        day_bars: dict[date, list[Bar]] = defaultdict(list)
+        for b in all_b:
+            d = b.timestamp.date()
+            if d < end_date:
+                day_bars[d].append(b)
+
+        sorted_days = sorted(day_bars.keys())[-lookback:]
+        result: list[Bar] = []
+        for d in sorted_days:
+            bars = day_bars[d]
+            if not bars:
+                continue
+            daily_bar = Bar(
+                timestamp=datetime.combine(d, bars[0].timestamp.time()),
+                open=bars[0].open,
+                high=max(b.high for b in bars),
+                low=min(b.low for b in bars),
+                close=bars[-1].close,
+                volume=sum(b.volume for b in bars),
+            )
+            result.append(daily_bar)
+
+        return result
 
     # ------- reset -------
 

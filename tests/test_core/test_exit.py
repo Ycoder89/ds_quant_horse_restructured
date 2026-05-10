@@ -164,7 +164,9 @@ class TestTimeStopExit:
         mgr = TimeStopExit(max_bars=12)
         pos = _long_pos(400.0)
         bar = Bar(TS, 400.0, 401.0, 399.0, 400.5, 1000)
-        should, sig, _ = mgr.check_by_count(pos, bar, bar_count=5)
+        # 调用 5 次，bar_count=5 < max_bars=12，不触发
+        for _ in range(5):
+            should, sig, _ = mgr.check(pos, bar)
         assert should is False
         assert sig is None
 
@@ -172,7 +174,10 @@ class TestTimeStopExit:
         mgr = TimeStopExit(max_bars=12)
         pos = _long_pos(400.0)
         bar = Bar(TS, 400.0, 401.0, 399.0, 400.5, 1000)
-        should, sig, _ = mgr.check_by_count(pos, bar, bar_count=12)
+        # 调用 12 次，最后一次触发退出
+        should, sig = False, None
+        for _ in range(12):
+            should, sig, _ = mgr.check(pos, bar)
         assert should is True
         assert sig is not None
         assert sig.exit_type is ExitType.TIME_STOP
@@ -182,7 +187,9 @@ class TestTimeStopExit:
         mgr = TimeStopExit(max_bars=12)
         pos = _short_pos(400.0)
         bar = Bar(TS, 400.0, 401.0, 399.0, 400.5, 1000)
-        should, sig, _ = mgr.check_by_count(pos, bar, bar_count=12)
+        should, sig = False, None
+        for _ in range(12):
+            should, sig, _ = mgr.check(pos, bar)
         assert should is True
         assert sig.side is OrderSide.BUY
 
